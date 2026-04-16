@@ -1,0 +1,58 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: /users/{uid}
+// Fields:
+//   - uid: string (required)
+//   - name: string (optional)
+//   - preferences: map (optional)
+//   - lastInteraction: timestamp (optional)
+//
+// Collection: /users/{uid}/messages/{messageId}
+// Fields:
+//   - role: string (required, enum: ['user', 'model'])
+//   - content: string (required)
+//   - timestamp: timestamp (required)
+//   - uid: string (required)
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidMessage(data) {
+      return data.role in ['user', 'model'] &&
+             data.content is string && data.content.size() < 10000 &&
+             data.timestamp is timestamp &&
+             data.uid == request.auth.uid;
+    }
+
+    function isValidUser(data) {
+      return data.uid == request.auth.uid &&
+             (!('name' in data) || (data.name is string && data.name.size() < 100)) &&
+             (!('preferences' in data) || data.preferences is map);
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid) && isValidUser(request.resource.data);
+      
+      match /messages/{messageId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidMessage(request.resource.data);
+        allow update, delete: if false; // Messages are immutable
+      }
+    }
+  }
+}

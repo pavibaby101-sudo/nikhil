@@ -1,0 +1,6 @@
+{
+  "name": "Aura AI Assistant",
+  "description": "A futuristic, voice-enabled AI assistant that learns from your interactions and responds with natural conversation.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}

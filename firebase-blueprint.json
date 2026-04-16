@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "UserSession": {
+      "title": "User Session",
+      "description": "Stores user preferences and long-term memory context.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "preferences": { "type": "object" },
+        "learnedFacts": { "type": "array", "items": { "type": "string" } },
+        "lastInteraction": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid"]
+    },
+    "ChatMessage": {
+      "title": "Chat Message",
+      "description": "Individual messages in a conversation history.",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "content": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "uid": { "type": "string" }
+      },
+      "required": ["role", "content", "timestamp", "uid"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserSession",
+      "description": "User profile and settings."
+    },
+    "/users/{uid}/messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Conversation history for the user."
+    }
+  }
+}
