@@ -8,7 +8,18 @@
         "uid": { "type": "string" },
         "name": { "type": "string" },
         "preferences": { "type": "object" },
-        "learnedFacts": { "type": "array", "items": { "type": "string" } },
+        "learnedFacts": { 
+          "type": "array", 
+          "items": { 
+            "type": "object",
+            "properties": {
+              "fact": { "type": "string" },
+              "category": { "type": "string" },
+              "confidence": { "type": "number" },
+              "timestamp": { "type": "string", "format": "date-time" }
+            }
+          } 
+        },
         "lastInteraction": { "type": "string", "format": "date-time" }
       },
       "required": ["uid"]

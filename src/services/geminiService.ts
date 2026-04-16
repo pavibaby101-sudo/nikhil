@@ -35,30 +35,119 @@ export async function saveMessage(uid: string, role: "user" | "model", content: 
   }, { merge: true });
 }
 
+export interface LearnedFact {
+  fact: string;
+  category: string;
+  confidence: number;
+  timestamp: string;
+}
+
+async function callNvidia(systemInstruction: string, messages: any[]) {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "meta/llama-3.1-405b-instruct",
+        messages: [
+          { role: "system", content: systemInstruction },
+          ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.parts[0].text }))
+        ],
+        max_tokens: 1024,
+        temperature: 0.7
+      })
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error("Nvidia API failed:", e);
+    return null;
+  }
+}
+
+async function callOpenRouter(systemInstruction: string, messages: any[]) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://aura-ai.app", // Optional
+        "X-Title": "Aura AI Assistant"
+      },
+      body: JSON.stringify({
+        model: "meta-llama/llama-3.1-405b-instruct",
+        messages: [
+          { role: "system", content: systemInstruction },
+          ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.parts[0].text }))
+        ]
+      })
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error("OpenRouter API failed:", e);
+    return null;
+  }
+}
+
+async function callGroq(systemInstruction: string, messages: any[]) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-70b-versatile",
+        messages: [
+          { role: "system", content: systemInstruction },
+          ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.parts[0].text }))
+        ],
+        max_tokens: 1024,
+        temperature: 0.7
+      })
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error("Groq API failed:", e);
+    return null;
+  }
+}
+
 export async function generateResponse(uid: string, userMessage: string, history: Message[]) {
-  // If Groq API key is available, we could use it here for even faster text.
-  // For now, we use Gemini Flash Lite which is already very fast.
-  const model = "gemini-3.1-flash-lite-preview";
-  
   const userDoc = await getDoc(doc(db, "users", uid));
   const userData = userDoc.data();
   const userName = userData?.name || "User";
-  const learnedFacts = userData?.learnedFacts || [];
+  const learnedFacts: LearnedFact[] = userData?.learnedFacts || [];
 
-  const systemInstruction = `You are Aura, a futuristic and highly intelligent AI voice assistant. 
-  Your personality is sophisticated, helpful, and slightly witty, similar to Jarvis or TARS.
-  The user's name is ${userName}.
-  
-  LEARNED FACTS ABOUT USER:
-  ${learnedFacts.length > 0 ? learnedFacts.map((f: string) => `- ${f}`).join('\n') : "No specific facts learned yet."}
+  const reliableFacts = learnedFacts
+    .filter(f => f.confidence > 0.7)
+    .map(f => `- [${f.category}] ${f.fact}`)
+    .join('\n');
 
-  Always respond in a natural, conversational tone. 
-  Keep responses very concise (1-2 sentences) for fast voice delivery.
-  You have access to the user's conversation history and you learn from interactions.`;
+  const systemInstruction = `You are Aura, a futuristic AI. 
+  User: ${userName}.
+  Memory: ${reliableFacts || "None"}.
+  Rules: Concise (1-2 sentences). Sophisticated tone. Use memory naturally.`;
 
-  const contents = [
-    ...history.slice(-6).map(m => ({ 
-      role: m.role,
+  const messages = [
+    ...history.slice(-8).map(m => ({ 
+      role: m.role === 'model' ? 'model' : 'user',
       parts: [{ text: m.content }]
     })),
     {
@@ -67,88 +156,73 @@ export async function generateResponse(uid: string, userMessage: string, history
     }
   ];
 
-  const result = await ai.models.generateContent({
-    model,
-    contents,
-    config: {
-      systemInstruction,
-      temperature: 0.7,
-    }
-  });
-
-  return result.text || "I'm sorry, I couldn't process that.";
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ systemInstruction, messages })
+    });
+    
+    if (!response.ok) throw new Error("API failed");
+    
+    const data = await response.json();
+    return data.text;
+  } catch (error) {
+    console.error("Chat API failed:", error);
+    return "I'm experiencing high traffic. Please try again in a moment.";
+  }
 }
 
 export async function learnFromInteraction(uid: string, userMessage: string, aiResponse: string) {
   try {
-    // Use Flash Lite for learning to avoid rate limits and maintain speed
-    const model = "gemini-3.1-flash-lite-preview";
     const userDoc = await getDoc(doc(db, "users", uid));
-    const currentFacts = userDoc.data()?.learnedFacts || [];
+    const currentFacts: LearnedFact[] = userDoc.data()?.learnedFacts || [];
 
-    const prompt = `Analyze the following exchange between a user and an AI assistant. 
-    Extract any new, relevant facts about the user (preferences, projects, names, dates, habits).
-    
-    Current known facts:
-    ${currentFacts.join('\n')}
-    
-    Exchange:
-    User: ${userMessage}
-    AI: ${aiResponse}
-    
-    Return a JSON array of strings containing ONLY the new facts to add. If no new facts are found, return an empty array [].
-    Do not repeat existing facts. Keep facts concise.`;
-
-    const result = await ai.models.generateContent({
-      model,
-      contents: [{ parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
-        }
-      }
+    const response = await fetch("/api/learn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userMessage, aiResponse, currentFacts })
     });
 
-    const text = result.text;
-    if (!text) return;
+    if (!response.ok) return;
+    const data = await response.json();
+    const newFactsRaw = data.facts;
 
-    const newFacts = JSON.parse(text);
-    if (Array.isArray(newFacts) && newFacts.length > 0) {
-      await setDoc(doc(db, "users", uid), {
-        learnedFacts: [...currentFacts, ...newFacts].slice(-50)
-      }, { merge: true });
+    if (Array.isArray(newFactsRaw) && newFactsRaw.length > 0) {
+      const newFacts: LearnedFact[] = newFactsRaw.map(f => ({
+        ...f,
+        timestamp: new Date().toISOString()
+      }));
+
+      const uniqueNewFacts = newFacts.filter(nf => 
+        !currentFacts.some(cf => cf.fact.toLowerCase().includes(nf.fact.toLowerCase()) || nf.fact.toLowerCase().includes(cf.fact.toLowerCase()))
+      );
+
+      if (uniqueNewFacts.length > 0) {
+        await setDoc(doc(db, "users", uid), {
+          learnedFacts: [...currentFacts, ...uniqueNewFacts].slice(-100)
+        }, { merge: true });
+      }
     }
-  } catch (error: any) {
-    // Silently handle rate limits for background tasks
-    if (error?.status === "RESOURCE_EXHAUSTED" || error?.message?.includes("429")) {
-      console.warn("Learning process paused due to rate limits.");
-    } else {
-      console.error("Learning process failed:", error);
-    }
+  } catch (error) {
+    console.error("Learning process failed:", error);
   }
 }
 
 export async function generateSpeech(text: string): Promise<string | null> {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: `Say naturally: ${text}` }] }],
-      config: {
-        responseModalities: ["AUDIO" as any],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: "Zephyr" }, // Zephyr sounds sophisticated
-          },
-        },
-      },
+    const response = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
     });
-
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    return base64Audio || null;
+    
+    if (!response.ok) return null;
+    
+    const data = await response.json();
+    return data.audio || null;
   } catch (error) {
-    console.error("Speech generation failed:", error);
+    console.error("TTS API failed:", error);
     return null;
   }
 }

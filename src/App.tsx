@@ -5,55 +5,74 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, MessageSquare, Settings, LogIn, LogOut, Volume2, VolumeX, Sparkles } from 'lucide-react';
+import { Mic, MicOff, MessageSquare, Settings, LogIn, LogOut, Volume2, VolumeX, Sparkles, AlertCircle } from 'lucide-react';
 import { auth, db } from './firebase';
 import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from 'firebase/auth';
-import { getConversationHistory, saveMessage, generateResponse, generateSpeech, learnFromInteraction, Message } from './services/geminiService';
+import { getConversationHistory, saveMessage, generateResponse, generateSpeech, learnFromInteraction, Message, LearnedFact } from './services/geminiService';
 import Markdown from 'react-markdown';
 import { doc, onSnapshot } from 'firebase/firestore';
 
+// Persistent AudioContext for faster playback and fewer "suspended" issues
+let globalAudioContext: AudioContext | null = null;
+
+function getAudioContext() {
+  if (!globalAudioContext) {
+    const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
+    globalAudioContext = new AudioContextClass({ sampleRate: 24000 });
+  }
+  return globalAudioContext;
+}
+
 // Audio helper to play Gemini TTS PCM data
 async function playPCM(base64Data: string) {
-  const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
-  const audioContext = new AudioContextClass({ sampleRate: 24000 });
-  
-  if (audioContext.state === 'suspended') {
-    await audioContext.resume();
-  }
-
-  const binaryString = atob(base64Data);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  if (!base64Data) {
+    console.error('No audio data provided to playPCM');
+    return;
   }
   
-  // PCM 16-bit Little Endian
-  const int16Data = new Int16Array(bytes.buffer);
-  const float32Data = new Float32Array(int16Data.length);
-  for (let i = 0; i < int16Data.length; i++) {
-    float32Data[i] = int16Data[i] / 32768.0;
-  }
-
-  const buffer = audioContext.createBuffer(1, float32Data.length, 24000);
-  buffer.getChannelData(0).set(float32Data);
-
-  const source = audioContext.createBufferSource();
-  source.buffer = buffer;
-  source.connect(audioContext.destination);
-  source.start();
+  console.log(`Playing PCM audio data (${base64Data.length} chars)...`);
   
-  return new Promise((resolve) => {
-    source.onended = () => {
-      audioContext.close();
-      resolve(true);
-    };
-  });
+  try {
+    const audioContext = getAudioContext();
+    
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    const binaryString = atob(base64Data);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    const int16Data = new Int16Array(bytes.buffer);
+    const float32Data = new Float32Array(int16Data.length);
+    for (let i = 0; i < int16Data.length; i++) {
+      float32Data[i] = int16Data[i] / 32768.0;
+    }
+
+    const buffer = audioContext.createBuffer(1, float32Data.length, 24000);
+    buffer.getChannelData(0).set(float32Data);
+
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContext.destination);
+    source.start();
+    
+    return new Promise((resolve) => {
+      source.onended = () => {
+        resolve(true);
+      };
+    });
+  } catch (err) {
+    console.error('Error in playPCM:', err);
+  }
 }
 
 export default function App() {
   const [user, setUser] = useState<any>(null);
-  const [learnedFacts, setLearnedFacts] = useState<string[]>([]);
+  const [learnedFacts, setLearnedFacts] = useState<LearnedFact[]>([]);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -63,6 +82,8 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [transcript, setTranscript] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [showSidebar, setShowSidebar] = useState(false);
+  const [showContext, setShowContext] = useState(false);
 
   const recognitionRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -98,32 +119,55 @@ export default function App() {
       };
 
       setVoice();
-      // If voices aren't loaded yet, they might load soon
       if (window.speechSynthesis.getVoices().length === 0) {
         window.speechSynthesis.onvoiceschanged = setVoice;
       }
 
+      // Watchdog to prevent hanging
+      const timeout = setTimeout(() => {
+        console.warn('SpeechSynthesis timed out');
+        window.speechSynthesis.cancel();
+        resolve(false); // Resolve with false to trigger fallback
+      }, 15000);
+
+      utterance.onstart = () => {
+        console.log('SpeechSynthesis started');
+      };
+
       utterance.onend = () => {
+        clearTimeout(timeout);
         resolve(true);
       };
       utterance.onerror = (e) => {
         console.error('SpeechSynthesis error', e);
-        resolve(true);
+        clearTimeout(timeout);
+        resolve(false);
       };
 
       window.speechSynthesis.speak(utterance);
-      
-      // Chrome bug: long utterances can time out. Resume every 10s if needed.
-      const resumeInterval = setInterval(() => {
-        if (!window.speechSynthesis.speaking) {
-          clearInterval(resumeInterval);
-        } else {
-          window.speechSynthesis.pause();
-          window.speechSynthesis.resume();
-        }
-      }, 10000);
     });
   };
+
+  // Pre-warm SpeechSynthesis on user interaction
+  const warmVoice = () => {
+    if (window.speechSynthesis) {
+      const utterance = new SpeechSynthesisUtterance('');
+      utterance.volume = 0;
+      window.speechSynthesis.speak(utterance);
+    }
+  };
+
+  useEffect(() => {
+    const handleGlobalClick = () => {
+      const audioContext = getAudioContext();
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      warmVoice();
+    };
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, []);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -178,11 +222,15 @@ export default function App() {
       };
 
       recognition.onerror = (event: any) => {
+        // Silently handle expected non-fatal events
+        if (event.error === 'no-speech' || event.error === 'aborted') {
+          setIsListening(false);
+          return;
+        }
+
         console.error('Speech recognition error', event.error);
         setIsListening(false);
-        if (event.error !== 'no-speech' && event.error !== 'aborted') {
-          setError(`Microphone error: ${event.error}`);
-        }
+        setError(`Microphone error: ${event.error}`);
       };
 
       recognition.onend = () => {
@@ -199,10 +247,32 @@ export default function App() {
     try {
       const provider = new GoogleAuthProvider();
       await signInWithPopup(auth, provider);
+      // Pre-warm AudioContext on login interaction
+      const audioContext = getAudioContext();
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
     } catch (err) {
       console.error('Login failed', err);
       setError('Login failed. Please try again.');
     }
+  };
+
+  const testSound = async () => {
+    const audioContext = getAudioContext();
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+    warmVoice();
+    // Play a short beep or silent buffer to confirm audio is working
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    gainNode.gain.value = 0.05;
+    oscillator.frequency.value = 440;
+    oscillator.start();
+    oscillator.stop(audioContext.currentTime + 0.1);
   };
 
   const handleLogout = () => signOut(auth);
@@ -214,10 +284,11 @@ export default function App() {
     }
 
     // Ensure AudioContext is resumed/initialized on user interaction
-    const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
-    const tempCtx = new AudioContextClass();
-    if (tempCtx.state === 'suspended') await tempCtx.resume();
-    tempCtx.close();
+    const audioContext = getAudioContext();
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+    warmVoice();
 
     if (isListening) {
       recognitionRef.current?.stop();
@@ -244,7 +315,7 @@ export default function App() {
             // Might already be starting or started
           }
         }
-      }, 600);
+      }, 400);
       return () => clearTimeout(timer);
     }
   }, [isAutoListen, isProcessing, isSpeaking, isListening, user]);
@@ -261,7 +332,8 @@ export default function App() {
 
       const responseText = await generateResponse(user.uid, text, messages);
       
-      await saveMessage(user.uid, 'model', responseText);
+      // Non-blocking save and UI update
+      saveMessage(user.uid, 'model', responseText);
       setMessages(prev => [...prev, { role: 'model', content: responseText, timestamp: new Date() } as Message]);
 
       // Background learning task
@@ -269,20 +341,25 @@ export default function App() {
 
       setIsSpeaking(true);
       
+      // Start fetching high-quality audio in background immediately
+      console.log('Pre-fetching high-quality TTS...');
+      const ttsPromise = generateSpeech(responseText);
+
       let speechSuccess = false;
       if (useTurboVoice && window.speechSynthesis) {
-        try {
-          await speakBrowser(responseText);
-          speechSuccess = true;
-        } catch (e) {
-          console.warn('Turbo voice failed, falling back to Gemini TTS', e);
-        }
+        console.log('Attempting Turbo Voice (Browser)...');
+        speechSuccess = await speakBrowser(responseText) as boolean;
       }
 
       if (!speechSuccess) {
-        const audioData = await generateSpeech(responseText);
+        console.log('Turbo Voice failed or skipped, using Gemini TTS fallback...');
+        const audioData = await ttsPromise;
         if (audioData) {
           await playPCM(audioData);
+        } else {
+          console.warn('Gemini TTS fallback failed, trying one last time...');
+          const fallbackAudio = await generateSpeech(responseText);
+          if (fallbackAudio) await playPCM(fallbackAudio);
         }
       }
     } catch (err) {
@@ -291,8 +368,6 @@ export default function App() {
     } finally {
       setIsProcessing(false);
       setIsSpeaking(false);
-      
-      // Recognition will auto-restart via onend listener
     }
   };
 
@@ -312,9 +387,32 @@ export default function App() {
   const lastModelMsg = [...messages].reverse().find(m => m.role === 'model')?.content;
 
   return (
-    <div className="flex h-screen w-full bg-bg-dark text-text-main font-sans overflow-hidden">
+    <div className="flex h-screen w-full bg-bg-dark text-text-main font-sans overflow-hidden relative">
+      {/* Mobile Overlays */}
+      <AnimatePresence>
+        {showSidebar && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowSidebar(false)}
+            className="fixed inset-0 bg-black/60 z-40 lg:hidden backdrop-blur-sm"
+          />
+        )}
+      </AnimatePresence>
+
       {/* Left Sidebar: Memory Engine */}
-      <aside className="w-72 border-r border-border-dim p-8 flex flex-col gap-8 bg-gradient-to-b from-bg-dark to-[#0d0d0d]">
+      <aside className={`
+        fixed inset-y-0 left-0 z-50 w-72 bg-gradient-to-b from-bg-dark to-[#0d0d0d] border-r border-border-dim p-8 flex flex-col gap-8 transition-transform duration-300 lg:relative lg:translate-x-0
+        ${showSidebar ? 'translate-x-0' : '-translate-x-full'}
+      `}>
+        <div className="flex justify-between items-center lg:hidden mb-4">
+          <span className="text-lg font-bold">Memory</span>
+          <button onClick={() => setShowSidebar(false)} className="p-2 hover:bg-white/5 rounded-full">
+            <VolumeX size={20} />
+          </button>
+        </div>
+
         <div className="flex-1 flex flex-col gap-8 overflow-hidden">
           <div className="flex flex-col h-1/2">
             <span className="text-[10px] uppercase tracking-[0.15em] text-text-dim mb-4 block">Recent Interactions</span>
@@ -340,15 +438,18 @@ export default function App() {
               {learnedFacts.length === 0 ? (
                 <p className="text-[11px] text-text-dim italic opacity-50">Aura is still learning about you...</p>
               ) : (
-                learnedFacts.map((fact, i) => (
+                learnedFacts.map((factObj, i) => (
                   <motion.div 
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     key={i} 
-                    className="text-[11px] text-text-dim flex gap-2 items-start"
+                    className="text-[11px] text-text-dim flex flex-col gap-0.5 p-2 bg-white/5 rounded-md border border-white/5"
                   >
-                    <span className="text-accent mt-1">•</span>
-                    <span>{fact}</span>
+                    <div className="flex justify-between items-center">
+                      <span className="text-accent uppercase text-[8px] tracking-widest font-bold">{factObj.category}</span>
+                      <span className="text-[8px] opacity-40">{Math.round(factObj.confidence * 100)}%</span>
+                    </div>
+                    <span>{factObj.fact}</span>
                   </motion.div>
                 ))
               )}
@@ -392,43 +493,74 @@ export default function App() {
       </aside>
 
       {/* Center: Main Interaction */}
-      <main className="flex-1 flex flex-col relative">
-        <header className="p-10 flex justify-between items-center">
-          <div className="text-lg font-bold tracking-tighter">
-            AETHER<span className="text-accent">.</span>
+      <main className="flex-1 flex flex-col relative min-w-0">
+        <header className="p-6 lg:p-10 flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <button onClick={() => setShowSidebar(true)} className="lg:hidden p-2 hover:bg-white/5 rounded-md">
+              <MessageSquare size={20} className="text-text-dim" />
+            </button>
+            <div className="text-lg font-bold tracking-tighter">
+              AETHER<span className="text-accent">.</span>
+            </div>
           </div>
           
-          <div className="flex items-center gap-6">
+          <div className="flex items-center gap-4 lg:gap-6">
             <AnimatePresence>
               {(isListening || isProcessing || isSpeaking) && (
                 <motion.div 
-                  initial={{ opacity: 0, x: 20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: 20 }}
-                  className="bg-accent-soft border border-accent text-accent px-3 py-1 rounded-full text-[11px] font-semibold uppercase tracking-wider"
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.9 }}
+                  className="bg-accent-soft border border-accent text-accent px-2 lg:px-3 py-1 rounded-full text-[9px] lg:text-[11px] font-semibold uppercase tracking-wider whitespace-nowrap"
                 >
-                  {isListening ? 'Listening...' : isProcessing ? 'Processing...' : 'Speaking...'}
+                  {isListening ? 'Listening' : isProcessing ? 'Processing' : 'Speaking'}
                 </motion.div>
               )}
             </AnimatePresence>
 
+            <button onClick={() => setShowContext(true)} className="lg:hidden p-2 hover:bg-white/5 rounded-md">
+              <Sparkles size={20} className="text-text-dim" />
+            </button>
+
             {user ? (
-              <button onClick={handleLogout} className="text-[10px] uppercase tracking-widest text-text-dim hover:text-white transition-colors">
+              <button onClick={handleLogout} className="hidden sm:block text-[10px] uppercase tracking-widest text-text-dim hover:text-white transition-colors">
                 Sign Out
               </button>
             ) : (
-              <button onClick={handleLogin} className="text-[10px] uppercase tracking-widest text-accent hover:text-white transition-colors">
+              <button onClick={handleLogin} className="hidden sm:block text-[10px] uppercase tracking-widest text-accent hover:text-white transition-colors">
                 Initialize
               </button>
             )}
           </div>
         </header>
 
-        <section className="flex-1 flex flex-col items-center justify-center px-16 pb-10">
-          <div className="relative w-60 h-60 mb-12 flex items-center justify-center">
+        <AnimatePresence>
+          {error && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="bg-red-500/10 border-y border-red-500/20 text-red-400 text-[10px] uppercase tracking-widest text-center py-2 relative overflow-hidden"
+            >
+              <div className="flex items-center justify-center gap-2">
+                <AlertCircle size={12} />
+                {error}
+              </div>
+              <button 
+                onClick={() => setError(null)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 p-1 hover:bg-white/5 rounded-full"
+              >
+                <MicOff size={12} />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <section className="flex-1 flex flex-col items-center justify-center px-6 lg:px-16 pb-10">
+          <div className="relative w-48 h-48 lg:w-60 lg:h-60 mb-8 lg:mb-12 flex items-center justify-center">
             {/* Orb Rings */}
-            <div className="absolute w-[220px] h-[220px] border border-border-dim rounded-full" />
-            <div className="absolute w-[180px] h-[180px] border border-white/5 rounded-full" />
+            <div className="absolute w-[180px] h-[180px] lg:w-[220px] lg:h-[220px] border border-border-dim rounded-full" />
+            <div className="absolute w-[140px] h-[140px] lg:w-[180px] lg:h-[180px] border border-white/5 rounded-full" />
             
             {/* The Orb */}
             <motion.div
@@ -441,7 +573,7 @@ export default function App() {
                 repeat: Infinity,
                 ease: "easeInOut"
               }}
-              className="w-36 h-36 rounded-full orb-glow shadow-[0_0_80px_rgba(99,102,241,0.2)] relative"
+              className="w-28 h-28 lg:w-36 lg:h-36 rounded-full orb-glow shadow-[0_0_80px_rgba(99,102,241,0.2)] relative"
             >
               <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-accent/20 to-transparent" />
             </motion.div>
@@ -452,21 +584,21 @@ export default function App() {
               className="absolute z-10 p-4 rounded-full hover:bg-white/5 transition-colors group"
             >
               {isListening ? (
-                <MicOff size={32} className="text-red-400" />
+                <MicOff size={28} className="text-red-400 lg:w-8 lg:h-8" />
               ) : (
-                <Mic size={32} className="text-white/40 group-hover:text-white transition-colors" />
+                <Mic size={28} className="text-white/40 group-hover:text-white transition-colors lg:w-8 lg:h-8" />
               )}
             </button>
           </div>
 
-          <div className="text-center max-w-2xl">
+          <div className="text-center max-w-2xl w-full">
             <AnimatePresence mode="wait">
               {transcript || lastUserMsg ? (
                 <motion.div 
                   key="query"
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="text-lg text-text-dim mb-4 font-normal italic"
+                  className="text-base lg:text-lg text-text-dim mb-4 font-normal italic"
                 >
                   "{transcript || lastUserMsg}"
                 </motion.div>
@@ -477,7 +609,7 @@ export default function App() {
               key="response"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="text-3xl font-medium leading-tight text-white"
+              className="text-xl lg:text-3xl font-medium leading-tight text-white"
             >
               {isProcessing ? (
                 <span className="opacity-30 animate-pulse">Analyzing request...</span>
@@ -488,15 +620,44 @@ export default function App() {
           </div>
         </section>
 
-        <footer className="p-10 border-t border-border-dim text-[11px] text-text-dim flex gap-6 uppercase tracking-widest">
+        <footer className="p-6 lg:p-10 border-t border-border-dim text-[9px] lg:text-[11px] text-text-dim flex flex-wrap gap-4 lg:gap-6 uppercase tracking-widest justify-center lg:justify-start items-center">
           <span>Latency: {isProcessing ? 'Calculating...' : '142ms'}</span>
           <span>Mood: {isSpeaking ? 'Expressive' : 'Analytical'}</span>
           <span>Confidence: 98.4%</span>
+          <button 
+            onClick={testSound}
+            className="px-3 py-1 border border-border-dim rounded-full hover:bg-white/5 transition-colors flex items-center gap-2"
+          >
+            <Volume2 size={12} />
+            Sound Check
+          </button>
         </footer>
       </main>
 
       {/* Right Panel: Technical Context */}
-      <aside className="w-80 p-8 border-l border-border-dim bg-black/50 backdrop-blur-sm">
+      <AnimatePresence>
+        {showContext && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowContext(false)}
+            className="fixed inset-0 bg-black/60 z-40 lg:hidden backdrop-blur-sm"
+          />
+        )}
+      </AnimatePresence>
+
+      <aside className={`
+        fixed inset-y-0 right-0 z-50 w-80 bg-black/50 backdrop-blur-md border-l border-border-dim p-8 flex flex-col transition-transform duration-300 lg:relative lg:translate-x-0
+        ${showContext ? 'translate-x-0' : 'translate-x-full'}
+      `}>
+        <div className="flex justify-between items-center lg:hidden mb-6">
+          <span className="text-lg font-bold">Context</span>
+          <button onClick={() => setShowContext(false)} className="p-2 hover:bg-white/5 rounded-full">
+            <VolumeX size={20} />
+          </button>
+        </div>
+
         <span className="text-[10px] uppercase tracking-[0.15em] text-text-dim mb-6 block">Contextual Analysis</span>
         
         <div className="pb-6 mb-6 border-b border-border-dim space-y-3">
